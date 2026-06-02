@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: querywiz-db
+    environment:
+      POSTGRES_USER: querywiz_user
+      POSTGRES_PASSWORD: querywiz_password
+      POSTGRES_DB: querywiz_ecommerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U querywiz_user -d querywiz_ecommerce"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: querywiz-app
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://querywiz_user:querywiz_password@postgres:5432/querywiz_ecommerce
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - RATE_LIMIT_MAX_PER_WINDOW=10
+      - RATE_LIMIT_MAX_PER_DAY=100
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  pgdata:
