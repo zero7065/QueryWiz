@@ -16,12 +16,30 @@ import { rateLimiter } from "../lib/rateLimit.ts";
 
 const router = Router();
 
-// Cache for query stats
+// In-memory request caching for identical questions (15 minutes TTL) to save API credits
+interface CacheEntry {
+  data: any;
+  expiresAt: number;
+}
+const queryCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 15 * 60 * 1000;
+
+// Regular cache cleanup every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of queryCache.entries()) {
+    if (val.expiresAt < now) {
+      queryCache.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// Cache for query stats header
 let cachedStats: any = null;
 let statsCacheTime = 0;
 
 /**
- * Midleware to protect Admin routes
+ * Middleware to protect Admin routes
  */
 function adminAuth(req: Request, res: Response, next: NextFunction) {
   const providedPassword = req.headers["x-admin-password"] as string;
@@ -77,7 +95,76 @@ router.get("/stats", async (req: Request, res: Response) => {
 });
 
 /**
- * PRIMARY NATURAL LANGUAGE TO SQL AND EXECUTION LAYER
+ * COMPONENT CONFIGURATION SETTINGS (EDITABLE VIA ADMIN PANEL)
+ */
+router.get("/config", async (req: Request, res: Response) => {
+  try {
+    const result = await executeQuery("SELECT key, value FROM admin_config");
+    const config: { [key: string]: any } = {};
+    
+    result.rows.forEach(row => {
+      try {
+        config[row.key] = JSON.parse(row.value);
+      } catch (e) {
+        config[row.key] = row.value; // simple text fallback
+      }
+    });
+
+    // Provide default example chips
+    if (!config.example_chips) {
+      config.example_chips = [
+        "Which Jadai project has the most monthly users?",
+        "Total revenue from ExamPadi subscriptions where plan_name = 'Annual'",
+        "What is the average proficiency of our database skills?",
+        "Show the version and deploy dates of all stable Railway deployments",
+        "How many subscribers came from Lagos or Abuja during JAMB season?"
+      ];
+    }
+    // Provide default exposed tables checklist
+    if (!config.exposed_live_tables) {
+      config.exposed_live_tables = ["projects", "tech_skills", "platform_events", "subscriptions", "deployments"];
+    }
+
+    res.json(config);
+  } catch (err) {
+    res.json({
+      example_chips: [
+        "Which Jadai project has the most monthly users?",
+        "Total revenue from ExamPadi subscriptions where plan_name = 'Annual'",
+        "What is the average proficiency of our database skills?",
+        "Show the version and deploy dates of all stable Railway deployments",
+        "How many subscribers came from Lagos or Abuja during JAMB season?"
+      ],
+      exposed_live_tables: ["projects", "tech_skills", "platform_events", "subscriptions", "deployments"]
+    });
+  }
+});
+
+router.post("/config", adminAuth, async (req: Request, res: Response) => {
+  const { key, value } = req.body;
+  if (!key) {
+    res.status(400).json({ error: "Missing config key parameter." });
+    return;
+  }
+
+  // Clear caches to allow configurations to refresh
+  queryCache.clear();
+
+  try {
+    const stringValue = typeof value === "string" ? value : JSON.stringify(value);
+    await executeQuery(
+      `INSERT INTO admin_config (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;`,
+      [key, stringValue]
+    );
+    res.json({ success: true, message: `Configuration [${key}] updated successfully.` });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PRIMARY NATURAL LANGUAGE TO SQL AND EXECUTION LAYER (WITH CACHING POOL)
  */
 router.post("/", rateLimiter, async (req: Request, res: Response) => {
   const { question, mode } = req.body;
@@ -86,6 +173,17 @@ router.post("/", rateLimiter, async (req: Request, res: Response) => {
 
   if (!question || typeof question !== "string") {
     res.status(400).json({ error: "Missing valid natural language question sentence." });
+    return;
+  }
+
+  const trimmedQuestion = question.trim();
+  const cacheKey = `${mode}:${trimmedQuestion.toLowerCase()}`;
+  
+  // Try hit cache
+  const cachedVal = queryCache.get(cacheKey);
+  if (cachedVal && cachedVal.expiresAt > Date.now()) {
+    console.log(`[QueryWiz Route] CACHE HIT for: "${trimmedQuestion}"`);
+    res.json(cachedVal.data);
     return;
   }
 
@@ -100,11 +198,39 @@ router.post("/", rateLimiter, async (req: Request, res: Response) => {
   let rowCount = 0;
 
   try {
-    // 1. Translate NL Question to SQL
+    // 1. Check if table is excluded from live visualization in config
+    if (isLive) {
+      try {
+        const configResult = await executeQuery("SELECT value FROM admin_config WHERE key = 'exposed_live_tables'");
+        if (configResult.rows.length > 0) {
+          const exposed: string[] = JSON.parse(configResult.rows[0].value);
+          const askedLower = question.toLowerCase();
+          const targetTables = ["projects", "tech_skills", "platform_events", "subscriptions", "deployments"];
+          const forbidden = targetTables.filter(t => !exposed.includes(t));
+          
+          for (const forbiddenTable of forbidden) {
+            if (askedLower.includes(forbiddenTable)) {
+              throw new Error(`The table '${forbiddenTable}' is locked and not exposed to the public live mode by system administrator configuration.`);
+            }
+          }
+        }
+      } catch (confErr: any) {
+        if (confErr.message.includes("locked")) {
+          throw confErr;
+        }
+      }
+    }
+
+    // 2. Translate NL Question to SQL
     sql = await translateQuestionToSQL(question, isLive);
     console.log(`[QueryWiz Route] NL-to-SQL completed. Mode=${mode}. Proposed SQL: ${sql}`);
 
-    // 2. Security Validation Checks
+    // If translate outputs error statement:
+    if (sql.includes("Cannot answer this question")) {
+      throw new Error("QueryWiz Translation Error: The AI model could not structure SQL tables for specified natural prompt.");
+    }
+
+    // 3. Security Validation Checks
     const validation = validateSQL(sql);
     if (!validation.isValid) {
       executionError = validation.message;
@@ -118,7 +244,7 @@ router.post("/", rateLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    // 3. Command Execution
+    // 4. Command Execution
     try {
       const qResult = await executeQuery(sql, [], isLive);
       rows = qResult.rows;
@@ -156,7 +282,7 @@ router.post("/", rateLimiter, async (req: Request, res: Response) => {
     const executionMs = Date.now() - startTime;
     await logQuery(question, sql, rowCount, executionMs, ip, null);
 
-    res.json({
+    const successResponse = {
       sql,
       rows,
       columns,
@@ -166,7 +292,15 @@ router.post("/", rateLimiter, async (req: Request, res: Response) => {
       retrySuccess,
       retryMessage,
       isLiveConfigured: isLiveModeConfigured()
+    };
+
+    // Store inCache pool only for solid successful values
+    queryCache.set(cacheKey, {
+      data: successResponse,
+      expiresAt: Date.now() + CACHE_TTL_MS
     });
+
+    res.json(successResponse);
 
   } catch (err: any) {
     const executionMs = Date.now() - startTime;
@@ -256,28 +390,53 @@ router.post("/followups", async (req: Request, res: Response) => {
 router.post("/admin/reseed", adminAuth, async (req: Request, res: Response) => {
   try {
     await ensureSchemaAndSeed(true);
-    res.json({ success: true, message: "Database re-seeded with pristine Jadai Studios mock analytics data." });
+    // Clear caches
+    queryCache.clear();
+    res.json({ success: true, message: "Database re-seeded with pristine Jadai portfolio datasets." });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to fully reseed." });
   }
 });
 
-// Logs monitor (Last 50 queries ran)
+// Logs monitor (Increased to 100 queries)
 router.get("/admin/logs", adminAuth, async (req: Request, res: Response) => {
   try {
-    const result = await executeQuery("SELECT id, question, generated_sql, row_count, execution_ms, ip_hash, error, created_at FROM query_logs ORDER BY created_at DESC LIMIT 50");
+    const result = await executeQuery(
+      `SELECT id, question, generated_sql, row_count, execution_ms, ip_hash, error, created_at 
+       FROM query_logs 
+       ORDER BY created_at DESC 
+       LIMIT 100`
+    );
     res.json({ logs: result.rows });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Admin stats overview
+// Admin stats overview with advanced traffic aggregation details
 router.get("/admin/stats", adminAuth, async (req: Request, res: Response) => {
   try {
     const totalResult = await executeQuery("SELECT COUNT(*) as total_count, AVG(execution_ms) as avg_execution_time, COUNT(DISTINCT ip_hash) as unique_hosts FROM query_logs");
     const errorResult = await executeQuery("SELECT COUNT(*) as count FROM query_logs WHERE error IS NOT NULL");
     
+    // Most popular questions
+    const freqResult = await executeQuery(
+      `SELECT question, COUNT(*) as count 
+       FROM query_logs 
+       WHERE question IS NOT NULL AND question != '' 
+       GROUP BY question 
+       ORDER BY count DESC 
+       LIMIT 8`
+    );
+
+    // Queries aggregated per hour to feed traffic sparkcharts
+    const hourlyAggregation = await executeQuery(
+      `SELECT SUBSTRING(CAST(created_at AS VARCHAR), 12, 2) as hour_str, COUNT(*) as count_val
+       FROM query_logs
+       GROUP BY 1
+       ORDER BY 1 ASC`
+    );
+
     // Live db status check
     const isLiveSetup = isLiveModeConfigured();
 
@@ -286,7 +445,9 @@ router.get("/admin/stats", adminAuth, async (req: Request, res: Response) => {
       avgExecutionMs: Math.round(Number(totalResult.rows[0]?.avg_execution_time ?? 0)),
       uniqueIps: Number(totalResult.rows[0]?.unique_hosts ?? 0),
       errorCount: Number(errorResult.rows[0]?.count ?? 0),
-      isLiveSetup
+      isLiveSetup,
+      frequentQueries: freqResult.rows,
+      hourlyTraffic: hourlyAggregation.rows
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
